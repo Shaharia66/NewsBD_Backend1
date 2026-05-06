@@ -25,7 +25,7 @@ public class OAuth2AuthenticationSuccessHandler extends SimpleUrlAuthenticationS
     private final UserRepository userRepository;
 
     // Your Vercel frontend URL
-    private static final String PRODUCTION_URL = "https://newsbd-frontend-nu.vercel.app";
+    private static final String PRODUCTION_URL = "https://newsbd-frontend1.vercel.app";
     private static final String LOCAL_URL = "http://localhost:3000";
 
     @Override
