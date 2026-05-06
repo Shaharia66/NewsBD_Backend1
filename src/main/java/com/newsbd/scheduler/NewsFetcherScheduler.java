@@ -23,6 +23,8 @@ import java.security.MessageDigest;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.*;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 import org.w3c.dom.Document;
 import org.w3c.dom.Element;
@@ -43,7 +45,7 @@ public class NewsFetcherScheduler {
     @Value("${app.guardian.url}")
     private String guardianUrl;
 
-    // ── Bangladesh RSS feeds (tested working) ──────────────
+    // ── Bangladesh RSS ─────────────────────────────────────
     private static final Map<String, String> BD_RSS_FEEDS = new LinkedHashMap<>() {{
         put("The Daily Star",  "https://thedailystar.net/rss.xml");
         put("Prothom Alo",     "https://prothomalo.com/feed");
@@ -52,22 +54,27 @@ public class NewsFetcherScheduler {
         put("Jugantor",        "https://www.jugantor.com/rss.xml");
     }};
 
-    // ── International RSS feeds (tested working) ───────────
+    // ── International RSS ──────────────────────────────────
     private static final Map<String, String> INTL_RSS_FEEDS = new LinkedHashMap<>() {{
-        put("BBC News",        "https://feeds.bbci.co.uk/news/rss.xml");
-        put("BBC Technology",  "https://feeds.bbci.co.uk/news/technology/rss.xml");
-        put("BBC Sport",       "https://feeds.bbci.co.uk/sport/rss.xml");
-        put("Al Jazeera",      "https://www.aljazeera.com/xml/rss/all.xml");
-        put("Sky News",        "https://feeds.skynews.com/feeds/rss/world.xml");
-        put("NPR News",        "https://feeds.npr.org/1001/rss.xml");
-        put("NPR Technology",  "https://feeds.npr.org/1019/rss.xml");
-        put("NPR Business",    "https://feeds.npr.org/1006/rss.xml");
+        put("BBC News",       "https://feeds.bbci.co.uk/news/rss.xml");
+        put("BBC Technology", "https://feeds.bbci.co.uk/news/technology/rss.xml");
+        put("BBC Sport",      "https://feeds.bbci.co.uk/sport/rss.xml");
+        put("Al Jazeera",     "https://www.aljazeera.com/xml/rss/all.xml");
+        put("Sky News",       "https://feeds.skynews.com/feeds/rss/world.xml");
+        put("NPR News",       "https://feeds.npr.org/1001/rss.xml");
+        put("NPR Technology", "https://feeds.npr.org/1019/rss.xml");
+        put("NPR Business",   "https://feeds.npr.org/1006/rss.xml");
     }};
 
     // ── Guardian sections ──────────────────────────────────
     private static final String[] GUARDIAN_SECTIONS = {
             "world", "technology", "sport", "politics", "business", "environment"
     };
+
+    // ── Image pattern to extract from HTML/description ────
+    private static final Pattern IMG_PATTERN = Pattern.compile(
+            "<img[^>]+src=[\"']([^\"']+)[\"'][^>]*>", Pattern.CASE_INSENSITIVE
+    );
 
     // ══════════════════════════════════════════════════════
     //  MAIN SCHEDULER
@@ -77,21 +84,14 @@ public class NewsFetcherScheduler {
     public void fetchAllNews() {
         log.info("========== News fetch cycle started ==========");
         int total = 0;
-
-        // 1. Bangladesh RSS
-        total += fetchRssFeeds(BD_RSS_FEEDS, Section.BANGLADESH);
-
-        // 2. International RSS
-        total += fetchRssFeeds(INTL_RSS_FEEDS, Section.INTERNATIONAL);
-
-        // 3. Guardian API
+        total += fetchRssFeeds(BD_RSS_FEEDS,   Section.BANGLADESH);
+        total += fetchRssFeeds(INTL_RSS_FEEDS,  Section.INTERNATIONAL);
         total += fetchGuardianNews();
-
         log.info("========== News fetch complete. {} new articles saved. ==========", total);
     }
 
     // ══════════════════════════════════════════════════════
-    //  RSS FEED FETCHER
+    //  RSS FETCHER
     // ══════════════════════════════════════════════════════
     private int fetchRssFeeds(Map<String, String> feeds, Section section) {
         int count = 0;
@@ -112,13 +112,14 @@ public class NewsFetcherScheduler {
     private int parseRssFeed(String feedUrl, String sourceName, Section section) {
         int saved = 0;
         try {
-            // Use HttpURLConnection with browser User-Agent to avoid 403
             URL url = new URL(feedUrl);
             HttpURLConnection conn = (HttpURLConnection) url.openConnection();
-            conn.setRequestProperty("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36");
-            conn.setRequestProperty("Accept", "application/rss+xml, application/xml, text/xml, */*");
-            conn.setConnectTimeout(8000);
-            conn.setReadTimeout(8000);
+            conn.setRequestProperty("User-Agent",
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0");
+            conn.setRequestProperty("Accept",
+                    "application/rss+xml, application/xml, text/xml, */*");
+            conn.setConnectTimeout(10000);
+            conn.setReadTimeout(10000);
             conn.connect();
 
             if (conn.getResponseCode() != 200) {
@@ -127,13 +128,14 @@ public class NewsFetcherScheduler {
             }
 
             InputStream stream = conn.getInputStream();
-
             DocumentBuilderFactory factory = DocumentBuilderFactory.newInstance();
+            factory.setNamespaceAware(true); // important for media: tags
             factory.setFeature("http://apache.org/xml/features/disallow-doctype-decl", false);
             factory.setFeature("http://xml.org/sax/features/external-general-entities", false);
             factory.setFeature("http://xml.org/sax/features/external-parameter-entities", false);
+
             DocumentBuilder builder = factory.newDocumentBuilder();
-            builder.setErrorHandler(null); // suppress XML warnings
+            builder.setErrorHandler(null);
             Document doc = builder.parse(stream);
             doc.getDocumentElement().normalize();
 
@@ -143,28 +145,36 @@ public class NewsFetcherScheduler {
             for (int i = 0; i < items.getLength(); i++) {
                 try {
                     Element item = (Element) items.item(i);
+
                     String title       = getTagValue(item, "title");
                     String link        = getTagValue(item, "link");
                     String description = getTagValue(item, "description");
+                    String content     = getTagValue(item, "content:encoded");
                     String pubDate     = getTagValue(item, "pubDate");
-                    String thumbnail   = getMediaThumbnail(item);
 
                     if (link == null || link.isBlank()) continue;
                     if (title == null || title.isBlank()) continue;
 
+                    // Clean title
+                    title = title.replaceAll("<[^>]*>", "").trim();
+
                     String hash = md5(link.trim());
                     if (articleRepository.existsByUrlHash(hash)) continue;
 
-                    // Clean HTML from description
+                    // Extract image — try multiple methods
+                    String thumbnail = extractImage(item, description, content);
+
+                    // Clean description
+                    String cleanDesc = null;
                     if (description != null) {
-                        description = description.replaceAll("<[^>]*>", "").trim();
-                        if (description.length() > 500) description = description.substring(0, 500) + "...";
+                        cleanDesc = description.replaceAll("<[^>]*>", "").trim();
+                        if (cleanDesc.length() > 500) cleanDesc = cleanDesc.substring(0, 500) + "...";
                     }
 
                     Article article = Article.builder()
                             .urlHash(hash)
-                            .title(title.trim())
-                            .description(description)
+                            .title(title)
+                            .description(cleanDesc)
                             .url(link.trim())
                             .urlToImage(thumbnail)
                             .sourceName(sourceName)
@@ -186,55 +196,133 @@ public class NewsFetcherScheduler {
         return saved;
     }
 
-    private String getTagValue(Element item, String tagName) {
-        NodeList nodes = item.getElementsByTagName(tagName);
-        if (nodes.getLength() > 0 && nodes.item(0) != null) {
-            return nodes.item(0).getTextContent();
+    // ══════════════════════════════════════════════════════
+    //  IMAGE EXTRACTION — tries all possible locations
+    // ══════════════════════════════════════════════════════
+    private String extractImage(Element item, String description, String content) {
+
+        // 1. media:thumbnail
+        String img = getAttributeFromTag(item, "media:thumbnail", "url");
+        if (isValidImg(img)) return img;
+
+        // 2. media:content with image type
+        img = getMediaContentImage(item);
+        if (isValidImg(img)) return img;
+
+        // 3. enclosure with image type
+        img = getEnclosureImage(item);
+        if (isValidImg(img)) return img;
+
+        // 4. Extract from content:encoded HTML
+        if (content != null) {
+            img = extractImgFromHtml(content);
+            if (isValidImg(img)) return img;
         }
+
+        // 5. Extract from description HTML
+        if (description != null) {
+            img = extractImgFromHtml(description);
+            if (isValidImg(img)) return img;
+        }
+
+        // 6. image tag directly
+        img = getTagValue(item, "image");
+        if (isValidImg(img)) return img;
+
+        // 7. itunes:image
+        img = getAttributeFromTag(item, "itunes:image", "href");
+        if (isValidImg(img)) return img;
+
         return null;
     }
 
-    private String getMediaThumbnail(Element item) {
-        // Try media:thumbnail
-        NodeList media = item.getElementsByTagName("media:thumbnail");
-        if (media.getLength() > 0) {
-            Element el = (Element) media.item(0);
-            String u = el.getAttribute("url");
-            if (u != null && !u.isBlank()) return u;
-        }
-        // Try media:content
-        NodeList mediaContent = item.getElementsByTagName("media:content");
-        if (mediaContent.getLength() > 0) {
-            Element el = (Element) mediaContent.item(0);
-            String u = el.getAttribute("url");
-            if (u != null && !u.isBlank() && el.getAttribute("medium").equals("image")) return u;
-        }
-        // Try enclosure
-        NodeList enclosure = item.getElementsByTagName("enclosure");
-        if (enclosure.getLength() > 0) {
-            Element el = (Element) enclosure.item(0);
-            String type = el.getAttribute("type");
-            if (type != null && type.startsWith("image")) {
-                return el.getAttribute("url");
+    private String getAttributeFromTag(Element item, String tagName, String attr) {
+        try {
+            NodeList nodes = item.getElementsByTagName(tagName);
+            if (nodes.getLength() > 0) {
+                Element el = (Element) nodes.item(0);
+                String val = el.getAttribute(attr);
+                if (val != null && !val.isBlank()) return val;
             }
-        }
+        } catch (Exception ignored) {}
+        return null;
+    }
+
+    private String getMediaContentImage(Element item) {
+        try {
+            NodeList nodes = item.getElementsByTagName("media:content");
+            for (int i = 0; i < nodes.getLength(); i++) {
+                Element el = (Element) nodes.item(i);
+                String medium = el.getAttribute("medium");
+                String type   = el.getAttribute("type");
+                String url    = el.getAttribute("url");
+                if ((medium.equals("image") || (type != null && type.startsWith("image")))
+                        && isValidImg(url)) {
+                    return url;
+                }
+            }
+            // If no image type found, just take first media:content URL
+            if (nodes.getLength() > 0) {
+                String url = ((Element) nodes.item(0)).getAttribute("url");
+                if (isValidImg(url)) return url;
+            }
+        } catch (Exception ignored) {}
+        return null;
+    }
+
+    private String getEnclosureImage(Element item) {
+        try {
+            NodeList nodes = item.getElementsByTagName("enclosure");
+            if (nodes.getLength() > 0) {
+                Element el   = (Element) nodes.item(0);
+                String type  = el.getAttribute("type");
+                String url   = el.getAttribute("url");
+                if (type != null && type.startsWith("image") && isValidImg(url)) return url;
+            }
+        } catch (Exception ignored) {}
+        return null;
+    }
+
+    private String extractImgFromHtml(String html) {
+        try {
+            Matcher m = IMG_PATTERN.matcher(html);
+            if (m.find()) {
+                String src = m.group(1);
+                if (isValidImg(src)) return src;
+            }
+        } catch (Exception ignored) {}
+        return null;
+    }
+
+    private boolean isValidImg(String url) {
+        return url != null && !url.isBlank() && url.startsWith("http")
+                && !url.contains("pixel") && !url.contains("1x1")
+                && !url.contains("tracking") && !url.contains("beacon");
+    }
+
+    private String getTagValue(Element item, String tagName) {
+        try {
+            NodeList nodes = item.getElementsByTagName(tagName);
+            if (nodes.getLength() > 0 && nodes.item(0) != null) {
+                return nodes.item(0).getTextContent();
+            }
+        } catch (Exception ignored) {}
         return null;
     }
 
     // ══════════════════════════════════════════════════════
-    //  GUARDIAN API
+    //  GUARDIAN
     // ══════════════════════════════════════════════════════
     private int fetchGuardianNews() {
         int count = 0;
         WebClient client = webClientBuilder.baseUrl(guardianUrl).build();
-
         for (String section : GUARDIAN_SECTIONS) {
             try {
                 Map<?, ?> response = client.get()
                         .uri(uriBuilder -> uriBuilder
                                 .path("/search")
                                 .queryParam("section", section)
-                                .queryParam("show-fields", "trailText,thumbnail")
+                                .queryParam("show-fields", "trailText,thumbnail,bodyText")
                                 .queryParam("page-size", "10")
                                 .queryParam("api-key", guardianKey)
                                 .build())
@@ -300,7 +388,7 @@ public class NewsFetcherScheduler {
     private Category mapCategory(String title, Section section) {
         if (title == null) return section == Section.BANGLADESH ? Category.LOCAL : Category.INTERNATIONAL;
         String t = title.toLowerCase();
-        if (t.contains("tech") || t.contains("ai") || t.contains("software") || t.contains("digital") || t.contains("cyber") || t.contains("startup") || t.contains("প্রযুক্তি") || t.contains("ডিজিটাল")) return Category.TECH;
+        if (t.contains("tech") || t.contains("ai ") || t.contains("software") || t.contains("digital") || t.contains("cyber") || t.contains("startup") || t.contains("প্রযুক্তি") || t.contains("ডিজিটাল")) return Category.TECH;
         if (t.contains("cricket") || t.contains("football") || t.contains("sport") || t.contains("match") || t.contains("bcb") || t.contains("fifa") || t.contains("icc") || t.contains("খেলা") || t.contains("ক্রিকেট")) return Category.SPORTS;
         if (t.contains("election") || t.contains("parliament") || t.contains("minister") || t.contains("government") || t.contains("political") || t.contains("vote") || t.contains("রাজনীতি") || t.contains("নির্বাচন") || t.contains("সরকার")) return Category.POLITICS;
         if (t.contains("economy") || t.contains("trade") || t.contains("export") || t.contains("business") || t.contains("bank") || t.contains("market") || t.contains("অর্থনীতি") || t.contains("ব্যবসা") || t.contains("বাজার")) return Category.BUSINESS;
@@ -347,7 +435,7 @@ public class NewsFetcherScheduler {
     }
 
     // ══════════════════════════════════════════════════════
-    //  MD5 HASH
+    //  MD5
     // ══════════════════════════════════════════════════════
     private String md5(String input) {
         try {
